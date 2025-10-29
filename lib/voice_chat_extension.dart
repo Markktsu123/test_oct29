@@ -596,10 +596,17 @@ class VoiceChatExtension {
       _playingController.add(true);
       _debugController.add('Playing voice message: $_currentPlayingPath');
 
+      final bytes = await file.readAsBytes();
+      final header = bytes.take(8).toList();
+      _debugController.add('[PLAY] Header bytes: ${header.map((b) => b.toRadixString(16).padLeft(2, "0")).join(" ")}'
+);
+
+
       // Listen for completion
       _player.onPlayerComplete.listen((_) {
         _isPlaying = false;
         _playingController.add(false);
+        
         _debugController.add('Voice message playback completed');
         
         // Clean up temporary file
