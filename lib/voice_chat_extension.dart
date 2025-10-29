@@ -558,8 +558,8 @@ class VoiceChatExtension {
           _debugController.add('[BT_TX] Sent chunk $chunkCount (${((i + VQVConstants.CHUNK_SIZE) / base64Audio.length * 100).toStringAsFixed(1)}%)');
         }
         
-        // Small delay to prevent overwhelming the ESP32
-        await Future.delayed(const Duration(microseconds: 800));
+        // Slow pacing for safe Bluetooth SPP transfer
+        await Future.delayed(const Duration(milliseconds: 5));
       }
 
       // Send end marker
@@ -669,7 +669,7 @@ class VoiceChatExtension {
         _isReceivingVoice = true;
         _voiceBuffer = '';
         _voiceReceiveTimeout?.cancel();
-        _voiceReceiveTimeout = Timer(Duration(seconds: 30), () {
+        _voiceReceiveTimeout = Timer(Duration(seconds: 60), () {
           if (_isReceivingVoice) {
             _debugController.add('Voice receive timeout - resetting buffer');
             _isReceivingVoice = false;
