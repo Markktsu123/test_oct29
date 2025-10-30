@@ -1,118 +1,102 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter_bluetooth_serial_plus/flutter_bluetooth_serial_plus.dart';
 
 class BluetoothService {
-  static final BluetoothService _instance = BluetoothService._internal();
-  factory BluetoothService() => _instance;
-  BluetoothService._internal();
+  final _messageCtrl = StreamController<String>.broadcast();   // legacy text lines (optional)
+  final _byteCtrl = StreamController<Uint8List>.broadcast();   // raw bytes (for frames)
+  final _connCtrl = StreamController<bool>.broadcast();
+  final _debugCtrl = StreamController<String>.broadcast();
 
   BluetoothConnection? _connection;
-  StreamController<String> _messageController = StreamController<String>.broadcast();
-  StreamController<bool> _connectionController = StreamController<bool>.broadcast();
-  StreamController<String> _debugController = StreamController<String>.broadcast();
-  
-  // Line buffer for accumulating data across Bluetooth packets
-  String _lineBuffer = '';
+  bool get isConnected => _connection?.isConnected == true;
 
-  Stream<String> get messageStream => _messageController.stream;
-  Stream<bool> get connectionStream => _connectionController.stream;
-  Stream<String> get debugStream => _debugController.stream;
-
-  bool get isConnected => _connection?.isConnected ?? false;
+  Stream<String> get messageStream => _messageCtrl.stream;
+  Stream<Uint8List> get byteStream => _byteCtrl.stream;
+  Stream<bool> get connectionStream => _connCtrl.stream;
+  Stream<String> get debugStream => _debugCtrl.stream;
 
   Future<List<BluetoothDevice>> getPairedDevices() async {
     try {
-      List<BluetoothDevice> devices = await FlutterBluetoothSerial.instance.getBondedDevices();
-      _debugController.add('Found ${devices.length} paired devices');
-      return devices;
+      return (await FlutterBluetoothSerial.instance.getBondedDevices());
     } catch (e) {
-      _debugController.add('Error getting paired devices: $e');
+      _debugCtrl.add('getPairedDevices error: $e');
       return [];
     }
   }
 
   Future<bool> connectToDevice(BluetoothDevice device) async {
     try {
-      _debugController.add('Attempting to connect to ${device.name}...');
-      
+      _debugCtrl.add('Connecting to ${device.address}...');
       _connection = await BluetoothConnection.toAddress(device.address);
-      
-      if (_connection?.isConnected == true) {
-        _debugController.add('Connected to ${device.name}');
-        _connectionController.add(true);
-        
-        // Start listening for incoming messages
-        _connection!.input!.listen((Uint8List data) {
-          String chunk = utf8.decode(data);
-          _lineBuffer += chunk;
-          _debugController.add('Received chunk: ${chunk.length} chars, buffer: ${_lineBuffer.length} chars');
-          
-          // Process complete lines
-          while (_lineBuffer.contains('\n')) {
-            int newlineIndex = _lineBuffer.indexOf('\n');
-            String completeLine = _lineBuffer.substring(0, newlineIndex);
-            _lineBuffer = _lineBuffer.substring(newlineIndex + 1);
-            
-            if (completeLine.isNotEmpty) {
-              _debugController.add('Received line: ${completeLine.length} chars');
-              _messageController.add(completeLine + '\n');
-            }
-          }
-        }).onError((error) {
-          _debugController.add('Error reading data: $error');
-        });
+      _debugCtrl.add('Connected to ${device.name ?? device.address}');
+      _connCtrl.add(true);
 
-        return true;
-      } else {
-        _debugController.add('Failed to connect to ${device.name}');
-        return false;
-      }
-    } catch (e) {
-      _debugController.add('Connection error: $e');
-      return false;
-    }
-  }
+      _connection!.input?.listen((Uint8List data) {
+        // Feed raw bytes for binary frames:
+        _byteCtrl.add(Uint8List.fromList(data));
 
-  Future<bool> sendMessage(String message) async {
-    if (_connection?.isConnected != true) {
-      _debugController.add('Cannot send message: not connected');
-      return false;
-    }
+        // Optional: also assemble lines for legacy logs
+        final str = String.fromCharCodes(data);
+        for (final line in str.split('\n')) {
+          final trimmed = line.trim();
+          if (trimmed.isNotEmpty) _messageCtrl.add(trimmed);
+        }
+      }).onDone(() {
+        _debugCtrl.add('Disconnected (remote closed).');
+        _connCtrl.add(false);
+      });
 
-    try {
-      // Ensure message ends with newline for ESP32 compatibility
-      String messageWithNewline = message.endsWith('\n') ? message : '$message\n';
-      
-      _connection!.output.add(utf8.encode(messageWithNewline));
-      await _connection!.output.allSent;
-      
-      _debugController.add('Sent: $message');
       return true;
     } catch (e) {
-      _debugController.add('Error sending message: $e');
+      _debugCtrl.add('Connect error: $e');
+      _connCtrl.add(false);
       return false;
     }
   }
 
   Future<void> disconnect() async {
     try {
-      await _connection?.close();
+      await _connection?.finish();
+      _connection?.dispose();
       _connection = null;
-      _lineBuffer = '';  // Clear buffer on disconnect
-      _connectionController.add(false);
-      _debugController.add('Disconnected from device');
+      _connCtrl.add(false);
     } catch (e) {
-      _debugController.add('Error disconnecting: $e');
+      _debugCtrl.add('Disconnect error: $e');
     }
   }
 
-  
+  // Legacy text helper (still used by debug console)
+  Future<bool> sendMessage(String text) async {
+    if (!isConnected) return false;
+    try {
+      _connection!.output.add(Uint8List.fromList((text + '\n').codeUnits));
+      await _connection!.output.allSent;
+      return true;
+    } catch (e) {
+      _debugCtrl.add('sendMessage error: $e');
+      return false;
+    }
+  }
+
+  // NEW: send raw bytes (binary frame)
+  Future<bool> sendBytes(Uint8List bytes) async {
+    if (!isConnected) return false;
+    try {
+      _connection!.output.add(bytes);
+      await _connection!.output.allSent;
+      return true;
+    } catch (e) {
+      _debugCtrl.add('sendBytes error: $e');
+      return false;
+    }
+  }
 
   void dispose() {
-    _messageController.close();
-    _connectionController.close();
-    _debugController.close();
+    _connection?.dispose();
+    _messageCtrl.close();
+    _byteCtrl.close();
+    _connCtrl.close();
+    _debugCtrl.close();
   }
 }

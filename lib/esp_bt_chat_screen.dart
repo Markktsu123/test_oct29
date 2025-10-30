@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter_bluetooth_serial_plus/flutter_bluetooth_serial_plus.dart';
@@ -12,16 +13,23 @@ class ESP32ChatScreen extends StatefulWidget {
   State<ESP32ChatScreen> createState() => _ESP32ChatScreenState();
 }
 
-class _ESP32ChatScreenState extends State<ESP32ChatScreen> {
+class _ESP32ChatScreenState extends State<ESP32ChatScreen> with SingleTickerProviderStateMixin {
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final ScrollController _debugScrollController = ScrollController();
   bool _isDebugConsoleVisible = false;
   bool _isRecording = false;
+  late final AnimationController _waveController;
 
   @override
   void initState() {
     super.initState();
+    _waveController = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200));
+    _waveController.addStatusListener((status) {
+      if (status == AnimationStatus.completed) {
+        _waveController.repeat();
+      }
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<ChatProvider>().loadPairedDevices();
     });
@@ -32,6 +40,18 @@ class _ESP32ChatScreenState extends State<ESP32ChatScreen> {
         setState(() {
           _isRecording = isRecording;
         });
+      }
+    });
+
+    // Start/stop wave animation with playback
+    context.read<ChatProvider>().voiceExtension.playingStream.listen((isPlaying) {
+      if (!mounted) return;
+      if (isPlaying) {
+        if (!_waveController.isAnimating) {
+          _waveController.forward(from: 0);
+        }
+      } else {
+        _waveController.stop();
       }
     });
   }
@@ -83,6 +103,12 @@ class _ESP32ChatScreenState extends State<ESP32ChatScreen> {
         );
       }
     });
+  }
+
+  @override
+  void dispose() {
+    _waveController.dispose();
+    super.dispose();
   }
 
   void _showDeviceDialog() {
@@ -476,24 +502,35 @@ class _ESP32ChatScreenState extends State<ESP32ChatScreen> {
             ),
             child: Row(
               children: [
-                // Voice recording button
-                GestureDetector(
-                  onTapDown: (_) => _startRecording(),
-                  onTapUp: (_) => _stopRecording(),
-                  onTapCancel: () => _stopRecording(),
-                  child: Container(
-                    width: 48,
-                    height: 48,
-                    decoration: BoxDecoration(
-                      color: _isRecording ? Colors.red : Colors.grey[300],
-                      shape: BoxShape.circle,
+                // Voice recording button with tap-to-toggle and wave indicator
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    GestureDetector(
+                      onTap: () {
+                        if (_isRecording) {
+                          _stopRecording();
+                        } else {
+                          _startRecording();
+                        }
+                      },
+                      child: Container(
+                        width: 48,
+                        height: 48,
+                        decoration: BoxDecoration(
+                          color: _isRecording ? Colors.red : Colors.grey[300],
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          _isRecording ? Icons.stop : Icons.mic,
+                          color: _isRecording ? Colors.white : Colors.grey[600],
+                          size: 24,
+                        ),
+                      ),
                     ),
-                    child: Icon(
-                      _isRecording ? Icons.stop : Icons.mic,
-                      color: _isRecording ? Colors.white : Colors.grey[600],
-                      size: 24,
-                    ),
-                  ),
+                    const SizedBox(width: 10),
+                    _RecordingWave(levelStream: context.read<ChatProvider>().voiceExtension.levelStream, active: _isRecording),
+                  ],
                 ),
                 const SizedBox(width: 12),
                 // Text input
@@ -600,46 +637,54 @@ class _ESP32ChatScreenState extends State<ESP32ChatScreen> {
   }
 
   Widget _buildVoiceMessageContent(voice.VoiceMessage voiceMessage) {
-    return GestureDetector(
-      onTap: () => _playVoiceMessage(voiceMessage),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.2),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.play_arrow,
-              color: Colors.white,
-              size: 20,
+    return Consumer<ChatProvider>(
+      builder: (context, provider, _) {
+        final isPlaying = provider.currentlyPlayingMessageId == voiceMessage.id && provider.voiceExtension.isPlaying;
+        return GestureDetector(
+          onTap: () => _playVoiceMessage(voiceMessage),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.2),
+              borderRadius: BorderRadius.circular(12),
             ),
-            const SizedBox(width: 8),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
-                  'Voice Message',
-                  style: TextStyle(
+                if (!isPlaying)
+                  Icon(
+                    Icons.play_arrow,
                     color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                Text(
-                  '${voiceMessage.formattedSize} • ${voiceMessage.formattedDuration}',
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: 12,
-                  ),
+                    size: 20,
+                  )
+                else
+                  _PlaybackWave(animation: _waveController),
+                const SizedBox(width: 8),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Voice Message',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      '${voiceMessage.formattedSize} • ${voiceMessage.formattedDuration}',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 
@@ -685,5 +730,72 @@ class _ESP32ChatScreenState extends State<ESP32ChatScreen> {
     } else {
       return DateFormat('MMM dd, HH:mm').format(dateTime);
     }
+  }
+}
+
+class _RecordingWave extends StatelessWidget {
+  final Stream<double> levelStream;
+  final bool active;
+  const _RecordingWave({required this.levelStream, required this.active});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<double>(
+      stream: levelStream,
+      initialData: 0.0,
+      builder: (context, snapshot) {
+        final level = (snapshot.data ?? 0.0).clamp(0.0, 1.0);
+        final bars = 5;
+        final List<Widget> children = [];
+        for (int i = 0; i < bars; i++) {
+          final variance = (1.0 - (i - 2).abs() * 0.15); // center bars taller
+          final double h = 8.0 + (active ? level * 40.0 * variance : 0.0);
+          children.add(AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            curve: Curves.easeOut,
+            width: 4,
+            height: h,
+            decoration: BoxDecoration(
+              color: active ? Colors.red : Colors.grey[300],
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ));
+          if (i != bars - 1) children.add(const SizedBox(width: 3));
+        }
+        return Row(children: children);
+      },
+    );
+  }
+}
+
+class _PlaybackWave extends StatelessWidget {
+  final Animation<double> animation;
+  const _PlaybackWave({required this.animation});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: animation,
+      builder: (context, _) {
+        final t = animation.value; // 0..1
+        final bars = 5;
+        final List<Widget> children = [];
+        for (int i = 0; i < bars; i++) {
+          final double phase = (i * 0.6);
+          final double wave = (0.5 + 0.5 * (math.sin((t * 2 * math.pi) + phase)));
+          final double h = 12.0 + wave * 18.0; // 12..30
+          children.add(Container(
+            width: 4,
+            height: h,
+            margin: const EdgeInsets.symmetric(horizontal: 1.5),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ));
+        }
+        return Row(children: children);
+      },
+    );
   }
 }

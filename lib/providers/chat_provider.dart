@@ -1,14 +1,16 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_bluetooth_serial_plus/flutter_bluetooth_serial_plus.dart';
 import '../services/bluetooth_service.dart';
 import '../voice_chat_extension.dart' as voice;
+import '../proto/frame.dart';
 
 class ChatProvider with ChangeNotifier {
   final BluetoothService _bluetoothService = BluetoothService();
   final voice.VoiceChatExtension _voiceExtension = voice.VoiceChatExtension();
-  
+
   List<BluetoothDevice> _pairedDevices = [];
   BluetoothDevice? _selectedDevice;
   bool _isConnected = false;
@@ -22,46 +24,59 @@ class ChatProvider with ChangeNotifier {
   List<ChatMessage> get messages => _messages;
   List<String> get debugLogs => _debugLogs;
   bool get isConnecting => _isConnecting;
-  
-  // Voice extension getters
+
   voice.VoiceChatExtension get voiceExtension => _voiceExtension;
   bool get isRecording => _voiceExtension.isRecording;
   bool get isPlaying => _voiceExtension.isPlaying;
 
-  StreamSubscription<String>? _messageSubscription;
-  StreamSubscription<bool>? _connectionSubscription;
-  StreamSubscription<String>? _debugSubscription;
+  StreamSubscription<String>? _legacyMsgSub;
+  StreamSubscription<Uint8List>? _byteSub;
+  StreamSubscription<bool>? _connectionSub;
+  StreamSubscription<String>? _debugSub;
+
+  final FrameParser _parser = FrameParser();
+  final Map<int, List<Uint8List?>> _rxByMsgId = {};
+  final Map<int, int> _rxTotalChunks = {};
 
   ChatProvider() {
     _init();
   }
 
   void _init() {
-    _messageSubscription = _bluetoothService.messageStream.listen((message) {
-      _processIncomingMessage(message);
+    // Binary stream (frames)
+    _byteSub = _bluetoothService.byteStream.listen((chunk) {
+      final frames = _parser.feed(chunk);
+      if (frames.isEmpty) return;
+      for (final f in frames) {
+        if (f.type == FrameType.text) {
+          final text = utf8.decode(f.payload, allowMalformed: true);
+          _addMessage(text, false);
+        } else if (f.type == FrameType.voice) {
+          _onVoiceFrame(f);
+        } else {
+          addStructuredDebug({'source': 'BT', 'event': 'Unknown frame', 'metrics': {'type': f.type}});
+        }
+      }
     });
 
-    _connectionSubscription = _bluetoothService.connectionStream.listen((connected) {
+    // Connection & debug
+    _connectionSub = _bluetoothService.connectionStream.listen((connected) {
       _isConnected = connected;
       notifyListeners();
     });
 
-    _debugSubscription = _bluetoothService.debugStream.listen((log) {
-      _debugLogs.add('${DateTime.now().toString().substring(11, 19)}: $log');
-      if (_debugLogs.length > 100) {
-        _debugLogs.removeAt(0);
-      }
-      notifyListeners();
+    _debugSub = _bluetoothService.debugStream.listen((log) {
+      _pushDebug(log);
     });
 
-    // Listen to voice extension debug stream
-    _voiceExtension.debugStream.listen((log) {
-      _debugLogs.add('${DateTime.now().toString().substring(11, 19)}: [VOICE] $log');
-      if (_debugLogs.length > 100) {
-        _debugLogs.removeAt(0);
-      }
-      notifyListeners();
-    });
+    // Existing voice extension debug passthrough
+    _voiceExtension.debugStream.listen((log) => _pushDebug('[VOICE] $log'));
+  }
+
+  void _pushDebug(String s) {
+    _debugLogs.add('${DateTime.now().toString().substring(11, 19)}: $s');
+    if (_debugLogs.length > 200) _debugLogs.removeAt(0);
+    notifyListeners();
   }
 
   Future<void> loadPairedDevices() async {
@@ -93,29 +108,36 @@ class ChatProvider with ChangeNotifier {
     notifyListeners();
   }
 
+  // TEXT: send as a single binary frame
   Future<bool> sendMessage(String text) async {
-    if (text.trim().isEmpty) return false;
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return false;
 
-    ChatMessage message = ChatMessage(
-      text: text.trim(),
+    final msg = ChatMessage(
+      text: trimmed,
       isMe: true,
       timestamp: DateTime.now(),
       status: MessageStatus.sending,
       type: voice.MessageType.text,
     );
-
-    _addMessage(message.text, true, message);
-
-    bool success = await _bluetoothService.sendMessage(text);
-    
-    if (success) {
-      message.status = MessageStatus.sent;
-    } else {
-      message.status = MessageStatus.failed;
-    }
-    
+    _messages.add(msg);
     notifyListeners();
-    return success;
+
+    final payload = Uint8List.fromList(utf8.encode(trimmed));
+    final msgId = DateTime.now().millisecondsSinceEpoch & 0xFFFF;
+    final frame = buildFrame(Frame(
+      type: FrameType.text,
+      flags: 0,
+      msgId: msgId,
+      chunkIdx: 0,
+      chunkCnt: 1,
+      payload: payload,
+    ));
+
+    final ok = await _bluetoothService.sendBytes(frame);
+    msg.status = ok ? MessageStatus.sent : MessageStatus.failed;
+    notifyListeners();
+    return ok;
   }
 
   /// Process incoming message and handle voice messages
@@ -229,106 +251,65 @@ class ChatProvider with ChangeNotifier {
     return await _voiceExtension.startRecording();
   }
 
-  /// Stop recording and send voice message with structured logging
   Future<bool> stopRecordingAndSend() async {
-    final recordingPath = await _voiceExtension.stopRecording();
-    if (recordingPath == null) {
-      addStructuredDebug({
-        'source': 'VOICE',
-        'event': 'Recording failed or retrying',
-        'metrics': {
-          'isRetrying': _voiceExtension.isRetrying,
-        }
-      });
+    final path = await _voiceExtension.stopRecording();
+    if (path == null) return false;
+
+    final bytes = await _voiceExtension.audioFileToBytes(path);
+    if (bytes == null || bytes.isEmpty) {
+      addStructuredDebug({'source': 'VOICE', 'event': 'Empty audio bytes'});
       return false;
     }
 
-    addStructuredDebug({
-      'source': 'VOICE',
-      'event': 'Recording completed',
-      'metrics': {
-        'filePath': recordingPath,
-      }
-    });
+    final duration = _voiceExtension.getRecordingDuration();
+    final msgId = DateTime.now().millisecondsSinceEpoch & 0xFFFF;
 
-    // Convert to Base64
-    final base64Audio = await _voiceExtension.audioFileToBase64(recordingPath);
-    if (base64Audio == null) {
-      addStructuredDebug({
-        'source': 'VOICE',
-        'event': 'Base64 encoding failed',
-        'metrics': {'filePath': recordingPath}
-      });
-      return false;
-    }
-
-    addStructuredDebug({
-      'source': 'VOICE',
-      'event': 'Base64 encoding completed',
-      'metrics': {
-        'base64Length': base64Audio.length,
-        'estimatedSizeKB': (base64Audio.length * 3 / 4 / 1024).toStringAsFixed(1),
-      }
-    });
-
-    // Calculate recording duration
-    final recordingDuration = _voiceExtension.getRecordingDuration();
-    
-    // Create voice message
-    final voiceMessage = voice.VoiceMessage.fromBase64(
-      base64Audio: base64Audio,
+    // (UI) add bubble early
+    final vm = voice.VoiceMessage.fromBytes(
+      audioBytes: bytes,
       isMe: true,
       status: MessageStatus.sending,
-      duration: recordingDuration,
+      duration: duration,
     );
-
-    // Add to messages
-    final chatMessage = ChatMessage(
+    final chatMsg = ChatMessage(
       text: '🎤 Voice message',
       isMe: true,
       timestamp: DateTime.now(),
       status: MessageStatus.sending,
       type: voice.MessageType.voice,
-      voiceMessage: voiceMessage,
+      voiceMessage: vm,
     );
-
-    _messages.add(chatMessage);
+    _messages.add(chatMsg);
     notifyListeners();
 
-    // Send over Bluetooth
-    final success = await _voiceExtension.sendVoiceMessage(
-      base64Audio,
-      (chunk) => _bluetoothService.sendMessage(chunk),
-    );
-
-    if (success) {
-      chatMessage.status = MessageStatus.sent;
-      voiceMessage.status = MessageStatus.sent;
-      addStructuredDebug({
-        'source': 'VOICE',
-        'event': 'Voice message sent successfully',
-        'metrics': {
-          'base64Length': base64Audio.length,
-          'chunkCount': (base64Audio.length / 28).ceil(),
-        }
-      });
-    } else {
-      chatMessage.status = MessageStatus.failed;
-      voiceMessage.status = MessageStatus.failed;
-      addStructuredDebug({
-        'source': 'VOICE',
-        'event': 'Voice message send failed',
-        'metrics': {'base64Length': base64Audio.length}
-      });
+    // chunk & send
+    const chunkSize = 512; // try 256..512
+    final total = (bytes.length / chunkSize).ceil();
+    var ok = true;
+    for (int i = 0; i < total; i++) {
+      final start = i * chunkSize;
+      final end = (start + chunkSize < bytes.length) ? start + chunkSize : bytes.length;
+      final frame = buildFrame(Frame(
+        type: FrameType.voice,
+        flags: (i < total - 1) ? 1 : 0,
+        msgId: msgId,
+        chunkIdx: i,
+        chunkCnt: total,
+        payload: Uint8List.sublistView(bytes, start, end),
+      ));
+      final s = await _bluetoothService.sendBytes(frame);
+      if (!s) { ok = false; break; }
+      await Future.delayed(const Duration(milliseconds: 2));
     }
 
+    chatMsg.status = ok ? MessageStatus.sent : MessageStatus.failed;
+    vm.status = ok ? MessageStatus.sent : MessageStatus.failed;
     notifyListeners();
-    return success;
+    return ok;
   }
 
-  /// Play voice message
-  Future<bool> playVoiceMessage(voice.VoiceMessage voiceMessage) async {
-    return await _voiceExtension.playVoiceMessage(voiceMessage.base64Audio);
+  Future<bool> playVoiceMessage(voice.VoiceMessage v) async {
+    return await _voiceExtension.playVoiceBytes(v.audioBytes);
   }
 
   /// Stop current playback
@@ -337,17 +318,13 @@ class ChatProvider with ChangeNotifier {
   }
 
   void _addMessage(String text, bool isMe, [ChatMessage? message]) {
-    if (message == null) {
-      message = ChatMessage(
-        text: text,
-        isMe: isMe,
-        timestamp: DateTime.now(),
-        status: isMe ? MessageStatus.sent : MessageStatus.delivered,
-        type: voice.MessageType.text,
-      );
-    }
-    
-    _messages.add(message);
+    _messages.add(message ?? ChatMessage(
+      text: text,
+      isMe: isMe,
+      timestamp: DateTime.now(),
+      status: isMe ? MessageStatus.sent : MessageStatus.delivered,
+      type: voice.MessageType.text,
+    ));
     notifyListeners();
   }
 
@@ -361,7 +338,6 @@ class ChatProvider with ChangeNotifier {
     notifyListeners();
   }
 
-  /// Add structured debug log with rich telemetry
   void addStructuredDebug(Map<String, dynamic> payload) {
     final timestamp = DateTime.now().toIso8601String();
     final logEntry = {
@@ -371,21 +347,14 @@ class ChatProvider with ChangeNotifier {
       'metrics': payload['metrics'] ?? {},
       ...payload,
     };
-    
     final logString = '[${logEntry['source']}] ${logEntry['event']}';
-    if (logEntry['metrics'].isNotEmpty) {
-      final metrics = logEntry['metrics'] as Map<String, dynamic>;
-      final metricsStr = metrics.entries
-          .map((e) => '${e.key}=${e.value}')
-          .join(', ');
-      _debugLogs.add('$logString ($metricsStr)');
+    if ((logEntry['metrics'] as Map).isNotEmpty) {
+      final m = (logEntry['metrics'] as Map).entries.map((e) => '${e.key}=${e.value}').join(', ');
+      _debugLogs.add('$logString ($m)');
     } else {
       _debugLogs.add(logString);
     }
-    
-    if (_debugLogs.length > 100) {
-      _debugLogs.removeAt(0);
-    }
+    if (_debugLogs.length > 200) _debugLogs.removeAt(0);
     notifyListeners();
   }
 
@@ -397,11 +366,50 @@ class ChatProvider with ChangeNotifier {
     return base64Pattern.hasMatch(str);
   }
 
+  void _onVoiceFrame(Frame f) async {
+    final parts = _rxByMsgId.putIfAbsent(f.msgId, () => List<Uint8List?>.filled(f.chunkCnt, null, growable: true));
+    if (parts.length < f.chunkCnt) {
+      parts.length = f.chunkCnt;
+    }
+    parts[f.chunkIdx] = f.payload;
+    _rxTotalChunks[f.msgId] = f.chunkCnt;
+
+    final complete = parts.length == f.chunkCnt && parts.every((e) => e != null);
+    if (!complete) return;
+
+    final bb = BytesBuilder();
+    for (final p in parts) { bb.add(p!); }
+    final audio = bb.toBytes();
+
+    final vm = voice.VoiceMessage.fromBytes(
+      audioBytes: audio,
+      isMe: false,
+      status: MessageStatus.received,
+      duration: null,
+    );
+
+    final chatMsg = ChatMessage(
+      text: '🎤 Voice message',
+      isMe: false,
+      timestamp: DateTime.now(),
+      status: MessageStatus.received,
+      type: voice.MessageType.voice,
+      voiceMessage: vm,
+    );
+
+    _messages.add(chatMsg);
+    notifyListeners();
+
+    _rxByMsgId.remove(f.msgId);
+    _rxTotalChunks.remove(f.msgId);
+  }
+
   @override
   void dispose() {
-    _messageSubscription?.cancel();
-    _connectionSubscription?.cancel();
-    _debugSubscription?.cancel();
+    _legacyMsgSub?.cancel();
+    _byteSub?.cancel();
+    _connectionSub?.cancel();
+    _debugSub?.cancel();
     _bluetoothService.dispose();
     _voiceExtension.dispose();
     super.dispose();
@@ -427,9 +435,5 @@ class ChatMessage {
 }
 
 enum MessageStatus {
-  sending,
-  sent,
-  delivered,
-  failed,
-  received,
+  sending, sent, delivered, failed, received,
 }

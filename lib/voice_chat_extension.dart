@@ -319,6 +319,8 @@ class VoiceChatExtension {
   final StreamController<bool> _recordingController = StreamController<bool>.broadcast();
   final StreamController<bool> _playingController = StreamController<bool>.broadcast();
   final StreamController<String> _debugController = StreamController<String>.broadcast();
+  final StreamController<double> _levelController = StreamController<double>.broadcast();
+  StreamSubscription? _recorderProgressSub;
 
   // Getters
   bool get isRecording => _isRecording;
@@ -328,6 +330,7 @@ class VoiceChatExtension {
   Stream<bool> get recordingStream => _recordingController.stream;
   Stream<bool> get playingStream => _playingController.stream;
   Stream<String> get debugStream => _debugController.stream;
+  Stream<double> get levelStream => _levelController.stream;
 
   // Setters
   set enableDiagnostics(bool value) => _enableDiagnostics = value;
@@ -409,6 +412,15 @@ class VoiceChatExtension {
         audioSource: AudioSource.microphone, // Explicit audio source
       );
 
+      // Mic level stream from recorder progress
+      _recorderProgressSub?.cancel();
+      _recorderProgressSub = _recorder.onProgress?.listen((event) {
+        // event.decibels typically ranges roughly [-60, 0]
+        final db = event.decibels ?? -60.0;
+        final normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+        _levelController.add(normalized);
+      });
+
       _isRecording = true;
       _recordingStartTime = DateTime.now();
       _recordingController.add(true);
@@ -444,6 +456,9 @@ class VoiceChatExtension {
       }
 
       await _recorder.stopRecorder();
+      _recorderProgressSub?.cancel();
+      _recorderProgressSub = null;
+      _levelController.add(0.0);
       _isRecording = false;
       _recordingController.add(false);
       
@@ -736,9 +751,11 @@ class VoiceChatExtension {
     _player.dispose();
     _retrySequencer.dispose();
     _voiceReceiveTimeout?.cancel();
+    _recorderProgressSub?.cancel();
     _recordingController.close();
     _playingController.close();
     _debugController.close();
+    _levelController.close();
   }
 }
 
